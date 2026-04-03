@@ -9,10 +9,11 @@ from torch_geometric.loader import DataLoader as DataLoader_pyg
 
 from mattersim.datasets.utils.convertor import GraphConvertor
 
-
 def build_dataloader(
     atoms: list[Atoms] = None,
     energies: list[float] = None,
+    charges: list[float] = None, 
+    fermi_values: list[float] = None,  
     forces: list[np.ndarray] = None,
     stresses: list[np.ndarray] = None,
     cutoff: float = 5.0,
@@ -37,6 +38,8 @@ def build_dataloader(
             - forces : a list of nx3 force matrix (np.ndarray) with unit eV/Å,
                 where n is the number of atom in each structure.
             - stresses : a list of 3x3 stress matrix (np.ndarray) with unit GPa
+        - charges 
+        - fermi_values
         - only_inference : if True, energies, forces and stresses will be ignored
         - num_workers : number of workers for dataloader
         - pin_memory : if True, the datasets will be stored in GPU or CPU memory
@@ -67,15 +70,17 @@ def build_dataloader(
             forces = [None] * length
         if stresses is None:
             stresses = [None] * length
+        if fermi_values is None:
+            fermi_values = [None] * length
+        if charges is None:   ## THIS IS ADDED
+            charges = [None] * length
 
     if model_type == "m3gnet":
         if multiprocessing == 0 and multithreading == 0:
-            # start = time.time()
-            for graph, energy, force, stress in zip(atoms, energies, forces, stresses):
-                graph = convertor.convert(graph.copy(), energy, force, stress, **kwargs)
+            for graph, energy, force, stress, charge, fermi in zip(atoms, energies, forces, stresses, charges, fermi_values):
+                graph = convertor.convert(graph.copy(), energy, force, stress, charge, fermi, **kwargs)
                 if graph is not None:
                     preprocessed_data.append(graph)
-            # print("Data preprocessing time: {:.2f} s".format(time.time() - start))
         elif multithreading > 0 and multiprocessing == 0:
             from multiprocessing.pool import ThreadPool
 
@@ -85,7 +90,7 @@ def build_dataloader(
             start = time.time()
             pool = ThreadPool(processes=multithreading)
             preprocessed_data = pool.starmap(
-                convertor.convert, zip(atoms, energies, forces, stresses)
+               convertor.convert, zip(atoms, energies, forces, stresses, charges, fermi_values) 
             )
             pool.close()
             print("Time elapsed: {:.2f} s".format(time.time() - start))
@@ -124,7 +129,6 @@ def build_dataloader(
 
     elif model_type == "graphormer" or model_type == "geomformer":
         raise NotImplementedError
-
 
 def multiprocess_data(atoms: list[Atoms], number):
     convertor = GraphConvertor()

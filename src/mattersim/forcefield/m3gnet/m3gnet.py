@@ -17,6 +17,9 @@ from .modules import (  # noqa: F501
 )
 from .scaling import AtomScaling
 
+from .modules.GCQeqSolver import GCQeqSolver
+from .modules.init_elemental_properties import get_sigma
+
 
 @compile_mode("script")
 class M3Gnet(nn.Module):
@@ -46,11 +49,28 @@ class M3Gnet(nn.Module):
             MainBlock(max_n, max_l, cutoff, units, max_n, threebody_cutoff)
             for i in range(num_blocks)
         ]
+
         self.graph_conv = nn.ModuleList(module_list)
-        self.final = GatedMLP(
-            in_dim=units,
+
+        self.MLP1 = GatedMLP(
+            in_dim=units+1,
             out_dims=[units, units, 1],
             activation=["swish", "swish", None],
+        )
+        self.MLP2 = GatedMLP(
+            in_dim=units+1, 
+            out_dims=[units, units, 1],
+            activation=["swish", "swish", "softplus"]
+        )
+        self.MLP3 = GatedMLP(
+            in_dim=units+1,
+            out_dims=[units, units, 1],
+            activation=["swish", "swish", None],
+        )
+        self.MLP4 = GatedMLP(
+            in_dim=units+1,
+            out_dims=[units, units, 1],
+            activation=["swish", "swish", "softplus"],
         )
         self.apply(self.init_weights)
         self.atom_embedding = MLP(
@@ -70,6 +90,8 @@ class M3Gnet(nn.Module):
             "threebody_cutoff": threebody_cutoff,
         }
 
+        self.register_buffer("sigma", get_sigma(self.max_z, device=device))
+
     def forward(
         self,
         input: Dict[str, torch.Tensor],
@@ -87,6 +109,7 @@ class M3Gnet(nn.Module):
         num_triple_ij = input["num_triple_ij"]
         num_atoms = input["num_atoms"]
         num_graphs = input["num_graphs"]
+        fermi = input["fermi"]
         batch = input["batch"]
 
         # -------------------------------------------------------------#
@@ -124,6 +147,8 @@ class M3Gnet(nn.Module):
         edge_attr = self.edge_encoder(edge_attr)
         three_basis = self.sbf(triple_edge_length, torch.acos(cos_jik))
 
+        sigma = self.sigma[atomic_numbers]
+
         # Main Loop
         for idx, conv in enumerate(self.graph_conv):
             atom_attr, edge_attr = conv(
@@ -139,11 +164,58 @@ class M3Gnet(nn.Module):
                 num_atoms,
             )
 
-        energies_i = self.final(atom_attr).view(-1)  # [batch_size*num_atoms]
-        energies_i = self.normalizer(energies_i, atomic_numbers)
-        energies = scatter(energies_i, batch, dim=0, dim_size=num_graphs)
+        fermi_per_atom = fermi[batch].unsqueeze(-1)  # shape: [num_atoms, 1]
+        aev_with_fermi = torch.cat([atom_attr, fermi_per_atom], dim=1)
 
-        return energies  # [batch_size]
+        chi = self.MLP1(aev_with_fermi).view(-1)  # [batch_size*num_atoms]
+        J = self.MLP2(aev_with_fermi).view(-1)  # [batch_size*num_atoms]
+        sigma_factor = self.MLP4(aev_with_fermi).view(-1)  # [batch_size*num_atoms]
+
+        Q_list = []
+        Q_tot_list = []
+        omega_list = []
+        E_coulomb_list = []
+        atom_offset = 0
+        for i in range(num_graphs):
+            n_atoms = num_atoms[i].item()
+
+            chi_i = chi[atom_offset:atom_offset + n_atoms]
+            J_i = J[atom_offset:atom_offset + n_atoms]
+            sigma_i = sigma[atom_offset:atom_offset + n_atoms]*sigma_factor[atom_offset:atom_offset + n_atoms]
+            pos_i = pos[atom_offset:atom_offset + n_atoms]
+            cell_i = cell[i]
+            fermi_i = fermi[i]
+
+            gcqeq = GCQeqSolver(cell = cell_i,
+                                pos = pos_i,
+                                chi = chi_i,
+                                J = J_i,
+                                fermi = fermi_i,
+                                sigmas = sigma_i,
+                                point_charge = True)
+            
+            Q_i, omega_i = gcqeq.forward()
+
+            Q_list.append(Q_i)
+            Q_tot_list.append(Q_i.sum())
+            omega_list.append(omega_i)
+            E_coulomb_list.append(gcqeq.calc_energy(Q_i))
+
+            atom_offset += n_atoms
+
+        Q_tot = torch.stack(Q_tot_list)  
+        omega = torch.stack(omega_list)
+        E_coulomb = torch.stack(E_coulomb_list)
+
+        Q_star = torch.cat(Q_list, dim=0).unsqueeze(-1)
+        aev_with_Q = torch.cat([atom_attr, Q_star], dim=1)
+
+        energies_i = self.MLP3(aev_with_Q).view(-1) # [batch_size*num_atoms]
+        energies_i = self.normalizer(energies_i, atomic_numbers)
+
+        energies = scatter(energies_i, batch, dim=0, dim_size=num_graphs) + omega
+
+        return energies, Q_tot, Q_star, chi, J, omega, E_coulomb, sigma_factor # [batch_size], [batch_size]
 
     def init_weights(self, m):
         if isinstance(m, nn.Linear):
