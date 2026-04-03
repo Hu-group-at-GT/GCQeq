@@ -34,6 +34,8 @@ Supported Properties:
     - "triple_edge_length"         ## tensor [num_three_body,1]
     - "phi"                        ## tensor [num_three_body,1]
     - "energy"                     ## float
+    - "charges"                    ## float
+    - "fermi"                      ## float
     - "forces"                     ## tensor [num_atoms,3]
     - "stress"                     ## tensor [3,3]
 """
@@ -176,6 +178,8 @@ class GraphConvertor:
         energy=None,
         forces=None,
         stress=None,
+        charges=None,
+        fermi=None, 
         pbc=True,
         **kwargs,
     ):
@@ -276,10 +280,14 @@ class GraphConvertor:
                 args["num_triple_ij"] = None
             if energy is not None:
                 args["energy"] = torch.FloatTensor([energy])
-            if forces is not None:
+            if forces is not None: 
                 args["forces"] = torch.FloatTensor(forces)
             if stress is not None:
                 args["stress"] = torch.FloatTensor(stress).unsqueeze(0)
+            if charges is not None:
+                args["charges"] = torch.FloatTensor([charges])
+            if fermi is not None:
+                args["fermi"] = torch.FloatTensor([fermi])
             return Data(**args)
 
         elif self.model_type == "graphormer":

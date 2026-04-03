@@ -73,6 +73,25 @@ class ReLULayer(nn.Module):
         return self.relu(self.linear(x))
 
 
+class SoftplusLayer(nn.Module):
+    def __init__(
+        self,
+        in_dim,
+        out_dim,
+        bias=True,
+    ):
+        super().__init__()
+        self.linear = nn.Linear(in_dim, out_dim, bias=bias)
+        self.softplus = nn.Softplus()
+
+    def forward(
+        self,
+        x,
+    ):
+        x = self.linear(x)
+        return self.softplus(x)
+
+
 class GatedMLP(nn.Module):
     def __init__(
         self,
@@ -99,6 +118,10 @@ class GatedMLP(nn.Module):
                 module_list_g.append(
                     SigmoidLayer(input_dim, out_dims[i], bias=use_bias)
                 )
+            elif activation[i] == "softplus":
+                module_list_g.append(
+                    SoftplusLayer(input_dim, out_dims[i], bias=use_bias)
+                )
             elif activation[i] is None:
                 module_list_g.append(  # noqa: E501
                     LinearLayer(input_dim, out_dims[i], bias=use_bias)
@@ -115,6 +138,10 @@ class GatedMLP(nn.Module):
             elif activation[i] == "sigmoid":
                 module_list_sigma.append(
                     SigmoidLayer(input_dim, out_dims[i], bias=use_bias)
+                )
+            elif activation[i] == "softplus":
+                module_list_sigma.append(
+                    SoftplusLayer(input_dim, out_dims[i], bias=use_bias)
                 )
             elif activation[i] is None:
                 module_list_sigma.append(
