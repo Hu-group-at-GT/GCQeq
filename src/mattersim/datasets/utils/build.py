@@ -6,14 +6,28 @@ import numpy as np
 import torch
 from ase import Atoms
 from torch_geometric.loader import DataLoader as DataLoader_pyg
+from tqdm import tqdm
 
 from mattersim.datasets.utils.convertor import GraphConvertor
+
+def save_preprocessed(data_list, path):
+    """Save preprocessed Data list to disk."""
+    torch.save(data_list, path)
+    print(f"Saved {len(data_list)} preprocessed graphs to {path}")
+
+
+def load_preprocessed(path):
+    """Load preprocessed Data list from disk."""
+    data_list = torch.load(path, weights_only=False)
+    print(f"Loaded {len(data_list)} preprocessed graphs from {path}")
+    return data_list
+
 
 def build_dataloader(
     atoms: list[Atoms] = None,
     energies: list[float] = None,
-    charges: list[float] = None, 
-    fermi_values: list[float] = None,  
+    charges: list[float] = None,
+    fermi_values: list[float] = None,
     forces: list[np.ndarray] = None,
     stresses: list[np.ndarray] = None,
     cutoff: float = 5.0,
@@ -28,6 +42,7 @@ def build_dataloader(
     multithreading: int = 0,
     dataset=None,
     finetune_task_label: list = None,
+    preprocessed_path: str = None,
     **kwargs,
 ):
     """
@@ -72,14 +87,40 @@ def build_dataloader(
             stresses = [None] * length
         if fermi_values is None:
             fermi_values = [None] * length
-        if charges is None:   ## THIS IS ADDED
+        if charges is None:  
             charges = [None] * length
 
+    import os
+
     if model_type == "m3gnet":
+        # Fast path: load from cache if available
+        if preprocessed_path and os.path.exists(preprocessed_path):
+            preprocessed_data = load_preprocessed(preprocessed_path)
+            print("Successfully loaded preprocessed data from {}".format(preprocessed_path))
+            return DataLoader_pyg(
+                preprocessed_data,
+                batch_size=batch_size,
+                shuffle=shuffle,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+            )
+
+        from mattersim.forcefield.m3gnet.modules.GCQeqSolver import precompute_ewald_data
+
         if multiprocessing == 0 and multithreading == 0:
-            for graph, energy, force, stress, charge, fermi in zip(atoms, energies, forces, stresses, charges, fermi_values):
+            for graph, energy, force, stress, charge, fermi in tqdm(
+                zip(atoms, energies, forces, stresses, charges, fermi_values),
+                total=len(atoms),
+                desc="Preprocessing graphs",
+            ):
                 graph = convertor.convert(graph.copy(), energy, force, stress, charge, fermi, **kwargs)
                 if graph is not None:
+                    ewald = precompute_ewald_data(graph.cell.squeeze(0), graph.atom_pos)
+                    graph.ewald_base_flat = ewald['base_matrix'].flatten()
+                    graph.ewald_distances = ewald['filtered_distances']
+                    graph.ewald_pair_i = ewald['pair_i']
+                    graph.ewald_pair_j = ewald['pair_j']
+                    graph.num_ewald_pairs = len(ewald['filtered_distances'])
                     preprocessed_data.append(graph)
         elif multithreading > 0 and multiprocessing == 0:
             from multiprocessing.pool import ThreadPool
@@ -118,6 +159,9 @@ def build_dataloader(
             print("Time for multiprocessing: {:.2f} s".format(time.time() - start))
         else:
             raise NotImplementedError
+
+        if preprocessed_path:
+            save_preprocessed(preprocessed_data, preprocessed_path)
 
         return DataLoader_pyg(
             preprocessed_data,

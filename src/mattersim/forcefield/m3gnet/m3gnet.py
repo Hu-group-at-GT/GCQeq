@@ -17,7 +17,7 @@ from .modules import (  # noqa: F501
 )
 from .scaling import AtomScaling
 
-from .modules.GCQeqSolver import GCQeqSolver
+from .modules.GCQeqSolver import GCQeqSolver, apply_sigma_correction
 from .modules.init_elemental_properties import get_sigma
 
 
@@ -171,39 +171,69 @@ class M3Gnet(nn.Module):
         J = self.MLP2(aev_with_fermi).view(-1)  # [batch_size*num_atoms]
         sigma_factor = self.MLP4(aev_with_fermi).view(-1)  # [batch_size*num_atoms]
 
+        # Build and solve Ewald system per graph (serial)
+        has_precomputed = "ewald_base_flat" in input
+        if has_precomputed:
+            base_flat = input["ewald_base_flat"]
+            ewald_dists = input["ewald_distances"]
+            ewald_pi = input["ewald_pair_i"]
+            ewald_pj = input["ewald_pair_j"]
+            num_ewald_pairs = input["num_ewald_pairs"]
+            base_offset = 0
+            pair_offset = 0
+
         Q_list = []
         Q_tot_list = []
         omega_list = []
         E_coulomb_list = []
+
         atom_offset = 0
         for i in range(num_graphs):
-            n_atoms = num_atoms[i].item()
+            n = num_atoms[i].item()
 
-            chi_i = chi[atom_offset:atom_offset + n_atoms]
-            J_i = J[atom_offset:atom_offset + n_atoms]
-            sigma_i = sigma[atom_offset:atom_offset + n_atoms]*sigma_factor[atom_offset:atom_offset + n_atoms]
-            pos_i = pos[atom_offset:atom_offset + n_atoms]
-            cell_i = cell[i]
+            chi_i = chi[atom_offset:atom_offset + n]
+            J_i = J[atom_offset:atom_offset + n]
+            sigma_i = sigma[atom_offset:atom_offset + n] * sigma_factor[atom_offset:atom_offset + n]
             fermi_i = fermi[i]
 
-            gcqeq = GCQeqSolver(cell = cell_i,
-                                pos = pos_i,
-                                chi = chi_i,
-                                J = J_i,
-                                fermi = fermi_i,
-                                sigmas = sigma_i,
-                                point_charge = True)
-            
-            Q_i, omega_i = gcqeq.forward()
+            if has_precomputed:
+                # Training path: precomputed base matrix + cheap sigma correction
+                n_sq = n * n
+                base_matrix_i = base_flat[base_offset:base_offset + n_sq].view(n, n)
+                k_i = num_ewald_pairs[i].item()
+                dists_i = ewald_dists[pair_offset:pair_offset + k_i]
+                pi_i = ewald_pi[pair_offset:pair_offset + k_i]
+                pj_i = ewald_pj[pair_offset:pair_offset + k_i]
+                energy_matrix_i = apply_sigma_correction(
+                    base_matrix_i, dists_i, pi_i, pj_i, sigma_i
+                )
+                base_offset += n_sq
+                pair_offset += k_i
+            else:
+                # Inference path: full Ewald computation
+                pos_i = pos[atom_offset:atom_offset + n]
+                cell_i = cell[i]
+                gcqeq = GCQeqSolver(
+                    cell=cell_i, pos=pos_i, sigmas=sigma_i, point_charge=False
+                )
+                energy_matrix_i = gcqeq.energy_matrix
+
+            A_i = energy_matrix_i + torch.diag(J_i)
+            RHS_i = chi_i + fermi_i
+
+            Q_i = -torch.linalg.solve(A_i, RHS_i)
+
+            omega_i = 0.5 * Q_i @ (A_i @ Q_i) + RHS_i @ Q_i
+            e_coulomb_i = 0.5 * torch.sum(energy_matrix_i * Q_i[:, None] * Q_i[None, :])
 
             Q_list.append(Q_i)
             Q_tot_list.append(Q_i.sum())
             omega_list.append(omega_i)
-            E_coulomb_list.append(gcqeq.calc_energy(Q_i))
+            E_coulomb_list.append(e_coulomb_i)
 
-            atom_offset += n_atoms
+            atom_offset += n
 
-        Q_tot = torch.stack(Q_tot_list)  
+        Q_tot = torch.stack(Q_tot_list)
         omega = torch.stack(omega_list)
         E_coulomb = torch.stack(E_coulomb_list)
 

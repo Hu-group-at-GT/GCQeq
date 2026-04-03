@@ -1180,8 +1180,16 @@ def batch_to_dict(graph_batch, model_type="m3gnet", device="cuda"):
         input["num_atoms"] = num_atoms
         input["num_graphs"] = num_graphs
         input["fermi"] = fermi
-        input["charges"] = charges 
+        input["charges"] = charges
         input["batch"] = batch
+
+        # Precomputed Ewald data (present when built via build_dataloader)
+        if hasattr(graph_batch, 'ewald_base_flat'):
+            input["ewald_base_flat"] = graph_batch.ewald_base_flat
+            input["ewald_distances"] = graph_batch.ewald_distances
+            input["ewald_pair_i"] = graph_batch.ewald_pair_i
+            input["ewald_pair_j"] = graph_batch.ewald_pair_j
+            input["num_ewald_pairs"] = graph_batch.num_ewald_pairs
     elif model_type == "graphormer" or model_type == "geomformer":
         raise NotImplementedError
     else:
