@@ -144,60 +144,138 @@ class GCQeqSolver:
 @torch.no_grad()
 def precompute_ewald_data(cell, pos, acc_factor=12.0, eps=1e-8):
     """
-    Precompute structure-dependent Ewald components (no sigma dependence).
-    Reuses GCQeqSolver with point_charge=True to get the base matrix,
-    and extracts filtered distances/indices for sigma correction at training time.
+    Precompute structure-dependent Ewald neighbor lists and k-vectors.
+
+    Only caches structural information (pair indices, shift vectors,
+    reciprocal-space vectors, Ewald parameters).  The actual energy matrix
+    is reconstructed at training time from live ``atom_pos`` via
+    :func:`recompute_energy_matrix` so that autograd can differentiate
+    through positions for correct force computation.
 
     Returns dict with:
-        base_matrix       : (N, N) energy matrix assuming point charges
-        filtered_distances: (K,)   pairwise distances within real-space cutoff
-        pair_i, pair_j    : (K,)   atom indices for each filtered distance
+        pair_i, pair_j  : (K,)   atom indices for real-space pairs
+        pair_shifts     : (K, 3) fractional lattice shifts for each pair
+        k_vectors       : (M, 3) reciprocal-space vectors within cutoff
+        k_lengths       : (M,)   norms of k_vectors
+        eta             : ()     Ewald splitting parameter
+        volume          : ()     cell volume
     """
-    dummy_sigmas = torch.zeros(pos.shape[0], device=pos.device)
-    solver = GCQeqSolver(
-        cell=cell, pos=pos, sigmas=dummy_sigmas,
-        point_charge=True, acc_factor=acc_factor, eps=eps,
-    )
+    num_atoms = pos.shape[0]
+    volume = torch.abs(torch.det(cell))
+    w = 1 / 2**0.5
+    accf = math.sqrt(math.log(10**acc_factor))
+    eta = (num_atoms * w / (volume**2)) ** (1 / 3) * math.pi
+    sqrt_eta = math.sqrt(eta)
+    cutoff_real = accf / sqrt_eta
+    cutoff_recip = 2 * sqrt_eta * accf
+
+    # Real space: find pairs within cutoff and record their shift vectors
+    shifts = get_shifts_within_cutoff(cell, cutoff_real)
+    disps_ij = pos[None, :, :] - pos[:, None, :]
+    disps = disps_ij[None, :, :, :] + torch.matmul(
+        shifts.to(cell.dtype), cell
+    )[:, None, None, :]
+    distances_all = torch.linalg.norm(disps, dim=-1)
+    within_cutoff = (distances_all > eps) & (distances_all < cutoff_real)
+    shift_idx, pair_i, pair_j = torch.where(within_cutoff)
+    pair_shifts = shifts[shift_idx]  # fractional lattice shift per pair
+
+    # Reciprocal space: find k-vectors within cutoff
+    recip = get_reciprocal_vectors(cell)
+    recip_shifts = get_shifts_within_cutoff(recip, cutoff_recip)
+    ks_all = torch.matmul(recip_shifts.to(recip.dtype), recip)
+    length_all = torch.linalg.norm(ks_all, dim=-1)
+    k_mask = (length_all > eps) & (length_all < cutoff_recip)
+    k_vectors = ks_all[k_mask]
+    k_lengths = length_all[k_mask]
+
     return {
-        'base_matrix': solver.energy_matrix,
-        'filtered_distances': solver.filtered_distances,
-        'pair_i': solver.filtered_pair_i,
-        'pair_j': solver.filtered_pair_j,
+        'pair_i': pair_i,
+        'pair_j': pair_j,
+        'pair_shifts': pair_shifts,
+        'k_vectors': k_vectors,
+        'k_lengths': k_lengths,
+        'eta': torch.tensor(eta, dtype=cell.dtype),
+        'volume': volume,
     }
 
 
-def apply_sigma_correction(base_matrix, filtered_distances, pair_i, pair_j, sigmas):
+def recompute_energy_matrix(pos, cell, sigmas, pair_i, pair_j, pair_shifts,
+                            k_vectors, k_lengths, eta, volume):
     """
-    Apply sigma-dependent Gaussian charge correction to a precomputed base matrix.
+    Reconstruct the full Ewald energy matrix with live positions in the
+    autograd graph, enabling correct force computation via backprop.
 
-    Only two cheap operations:
-      - Real space: subtract erfc(d / (sqrt(2) * gamma_ij)) / d for each filtered pair
-      - Self energy: add 1 / (sqrt(pi) * sigma_i) on the diagonal
+    Cached structural data (pair indices, shifts, k-vectors) avoids the
+    expensive neighbor search, while positions are recomputed so that
+    ``torch.autograd.grad(energy, atom_pos)`` captures Coulomb forces.
 
     Parameters
     ----------
-    base_matrix         : (N, N) precomputed point-charge Ewald matrix (no grad)
-    filtered_distances  : (K,)   distances within cutoff (no grad)
-    pair_i, pair_j      : (K,)   atom index pairs (no grad)
-    sigmas              : (N,)   learned Gaussian widths (carries gradient)
+    pos          : (N, 3) atom positions (requires_grad=True)
+    cell         : (3, 3) unit cell
+    sigmas       : (N,)   learned Gaussian widths
+    pair_i/j     : (K,)   atom index pairs from cache
+    pair_shifts  : (K, 3) fractional lattice shifts from cache
+    k_vectors    : (M, 3) reciprocal-space vectors from cache
+    k_lengths    : (M,)   norms of k_vectors from cache
+    eta          : float  Ewald splitting parameter
+    volume       : float  cell volume
     """
-    num_atoms = base_matrix.shape[0]
+    num_atoms = pos.shape[0]
+    eta_val = float(eta)
+    vol_val = float(volume)
+    sqrt_eta = math.sqrt(eta_val)
 
-    # Real space correction: -erfc(d / (sqrt(2) * gamma_ij)) / d
+    # --- Real space (autograd through pos) ---
+    disps = pos[pair_j] - pos[pair_i] + pair_shifts @ cell  # (K, 3)
+    distances = torch.linalg.norm(disps, dim=-1)  # (K,)
+
+    # Point-charge erfc term
+    real_vals = torch.erfc(sqrt_eta * distances) / distances
+    # Sigma correction: subtract Gaussian-smeared part
     gammas = torch.sqrt(sigmas[pair_i] ** 2 + sigmas[pair_j] ** 2)
-    corrections = -torch.erfc(filtered_distances / (math.sqrt(2) * gammas)) / filtered_distances
+    real_vals = real_vals - torch.erfc(
+        distances / (math.sqrt(2) * gammas)
+    ) / distances
 
-    correction_matrix = torch.zeros(
-        num_atoms, num_atoms, device=sigmas.device, dtype=sigmas.dtype
+    real_matrix = torch.zeros(
+        num_atoms, num_atoms, device=pos.device, dtype=pos.dtype
     )
-    correction_matrix = correction_matrix.index_put(
-        (pair_i, pair_j), COULOMB_FACTOR * corrections, accumulate=True
+    real_matrix = real_matrix.index_put(
+        (pair_i, pair_j), COULOMB_FACTOR * real_vals, accumulate=True
     )
 
-    # Self energy correction: +1 / (sqrt(pi) * sigma_i) on diagonal
-    self_correction = COULOMB_FACTOR / (math.sqrt(math.pi) * sigmas.flatten())
+    # --- Reciprocal space (autograd through pos) ---
+    disps_ij = pos.unsqueeze(0) - pos.unsqueeze(1)  # (N, N, 3)
+    phases = torch.einsum('kd,ijd->kij', k_vectors, disps_ij)  # (M, N, N)
+    recip_weights = (
+        torch.exp(-k_lengths ** 2 / (4 * eta_val)) / k_lengths ** 2
+    )  # (M,)
+    recip_matrix = (
+        COULOMB_FACTOR * 4.0 * math.pi / vol_val
+        * torch.einsum('k,kij->ij', recip_weights, torch.cos(phases))
+    )
 
-    return base_matrix + correction_matrix + torch.diag(self_correction)
+    # --- Self energy ---
+    diag = -2 * math.sqrt(eta_val / math.pi) * torch.ones(
+        num_atoms, device=pos.device, dtype=pos.dtype
+    )
+    diag = diag + 1.0 / (math.sqrt(math.pi) * sigmas.flatten())
+    self_matrix = COULOMB_FACTOR * torch.diag(diag)
+
+    # --- Dipole correction (autograd through pos z-coordinates) ---
+    z = pos[:, 2]
+    prefac = 4.0 * math.pi / vol_val
+    term1 = z.unsqueeze(1) * z.unsqueeze(0)
+    z_sq = z ** 2
+    term2 = 0.5 * (z_sq.unsqueeze(1) + z_sq.unsqueeze(0))
+    Lz = torch.norm(cell[2], dim=-1)
+    ones = torch.ones(num_atoms, device=pos.device, dtype=pos.dtype)
+    term3 = (Lz ** 2 / 12.0) * ones.unsqueeze(1) * ones.unsqueeze(0)
+    dipole_matrix = COULOMB_FACTOR * prefac * (term1 - term2 - term3)
+
+    return real_matrix + recip_matrix + self_matrix + dipole_matrix
 
 
 # ---------------------------------------------------------------------------

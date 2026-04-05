@@ -301,6 +301,8 @@ class Potential(nn.Module):
                     del train_data
                     torch.cuda.empty_cache()
             else:
+                if is_distributed and hasattr(dataloader, "sampler") and isinstance(dataloader.sampler, torch.utils.data.distributed.DistributedSampler):
+                    dataloader.sampler.set_epoch(epoch)
                 metric = self.train_one_epoch(
                     dataloader,
                     epoch,
@@ -392,10 +394,11 @@ class Potential(nn.Module):
                     "val_mae_e",
                     "val_mae_f",
                     "val_mae_s",
+                    "val_mae_c",
                 ], (
                     f"`{metric_name}` metric name not supported. "
                     "supported metrics: `val_loss`, `val_mae_e`, "
-                    "`val_mae_f`, `val_mae_s`"
+                    "`val_mae_f`, `val_mae_s`, `val_mae_c`"
                 )
 
                 if (
@@ -563,7 +566,7 @@ class Potential(nn.Module):
         include_energy,
         include_forces,
         include_stresses,
-        include_charges, 
+        include_charges,
         loss_f,
         loss_s,
         loss_c,
@@ -598,7 +601,7 @@ class Potential(nn.Module):
                     input,
                     include_forces=include_forces,
                     include_stresses=include_stresses,
-                    include_charges=include_charges, 
+                    include_charges=include_charges,
                 )
             elif mode == "val":
                 with self.ema.average_parameters():
@@ -616,23 +619,17 @@ class Potential(nn.Module):
                 include_energy,
                 include_forces,
                 include_stresses,
-                include_charges, 
+                include_charges,
                 loss_f,
                 loss_s,
-                loss_c, 
+                loss_c,
             )
 
-            # loss backward
             if mode == "train":
                 self.optimizer.zero_grad()
                 loss_.backward()
-                nn.utils.clip_grad_norm_(
-                    self.model.parameters(), 1.0, norm_type=2  # noqa: E501
-                )
+                nn.utils.clip_grad_norm_(self.model.parameters(), 1.0, norm_type=2)
                 self.optimizer.step()
-                # scaler.scale(loss_).backward()
-                # scaler.step(self.optimizer)
-                # scaler.update()
                 self.ema.update()
 
             loss_avg.update(loss_.detach())
@@ -642,39 +639,42 @@ class Potential(nn.Module):
                 train_f_mae.update(f_mae.detach())
             if include_stresses:
                 train_s_mae.update(s_mae.detach())
-            if include_charges: 
-                train_c_mae.update(c_mae.detach()) 
+            if include_charges:
+                train_c_mae.update(c_mae.detach())
 
-        loss_avg_ = loss_avg.compute().item()
-        if include_energy:
-            e_mae = train_e_mae.compute().item()
+        # Reduce metrics across GPUs: sum the raw numerators and denominators
+        # so the result is the true global mean, not an average of rank means.
+        if is_distributed:
+            metrics = [loss_avg, train_e_mae, train_f_mae, train_s_mae, train_c_mae]
+            sums = torch.stack([m.mean_value for m in metrics])
+            counts = torch.stack([m.weight for m in metrics])
+            torch.distributed.all_reduce(sums, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
+            global_means = sums / counts.clamp(min=1)
+            loss_avg_ = global_means[0].item()
+            e_mae = global_means[1].item() if include_energy else 0
+            f_mae = global_means[2].item() if include_forces else 0
+            s_mae = global_means[3].item() if include_stresses else 0
+            c_mae = global_means[4].item() if include_charges else 0
         else:
-            e_mae = 0
-        if include_forces:
-            f_mae = train_f_mae.compute().item()
-        else:
-            f_mae = 0
-        if include_stresses:
-            s_mae = train_s_mae.compute().item()
-        else:
-            s_mae = 0
-        if include_charges:
-            c_mae = train_c_mae.compute().item()
-        else:
-            c_mae = 0
-        if log: 
+            loss_avg_ = loss_avg.compute().item()
+            e_mae = train_e_mae.compute().item() if include_energy else 0
+            f_mae = train_f_mae.compute().item() if include_forces else 0
+            s_mae = train_s_mae.compute().item() if include_stresses else 0
+            c_mae = train_c_mae.compute().item() if include_charges else 0
+
+        if log and ((not is_distributed) or self.rank == 0):
             logger.info(
-                "%s: Loss: %.4f, MAE(e): %.4f, MAE(f): %.4f, MAE(s): %.4f, MAE(c): %.4f, Time: %.2fs, lr: %.8f\n"  # noqa: E501
+                "%s: Loss: %.4f, MAE(e): %.4f, MAE(f): %.4f, MAE(s): %.4f, MAE(c): %.4f, Time: %.2fs, lr: %.8f\n"
                 % (
                     mode,
-                    loss_avg.compute().item(),
+                    loss_avg_,
                     e_mae,
                     f_mae,
                     s_mae,
-                    c_mae, 
+                    c_mae,
                     time.time() - start_time,
-                    #self.scheduler.get_last_lr()[0],
-                    self.optimizer.param_groups[0]['lr'],
+                    self.optimizer.param_groups[0]["lr"],
                 ),
             )
 
@@ -685,15 +685,14 @@ class Potential(nn.Module):
                     f"{mode}/mae_e": e_mae,
                     f"{mode}/mae_f": f_mae,
                     f"{mode}/mae_s": s_mae,
-                    f"{mode}/mae_c": c_mae, 
-  #                  f"{mode}/lr": self.scheduler.get_last_lr()[0],
-                    f"{mode}/lr": self.optimizer.param_groups[0]['lr'],
-                    f"{mode}/mae_tot": e_mae + f_mae + s_mae + c_mae, 
+                    f"{mode}/mae_c": c_mae,
+                    f"{mode}/lr": self.optimizer.param_groups[0]["lr"],
+                    f"{mode}/mae_tot": e_mae + f_mae + s_mae + c_mae,
                 },
                 step=epoch,
             )
 
-        return (loss_avg_, e_mae, f_mae, s_mae, c_mae) 
+        return (loss_avg_, e_mae, f_mae, s_mae, c_mae)
 
     def loss_calc(
         self,
@@ -831,7 +830,7 @@ class Potential(nn.Module):
                     (torch.eye(3, device=self.device)[None, ...] + strain_augment),
                 )
                 volume = torch.linalg.det(input["cell"])
-            energies, Q_tot, Q_star, chi, J, omega, E_coulomb,sigma_fac = self.model.forward(input, dataset_idx)
+            energies, Q_tot, Q_star, chi, J, omega, E_coulomb,sigma_fac = self.model(input, dataset_idx)
             output["total_energy"] = energies
 
             if include_charges:
@@ -1161,8 +1160,8 @@ def batch_to_dict(graph_batch, model_type="m3gnet", device="cuda"):
         num_triple_ij = graph_batch.num_triple_ij
         num_atoms = graph_batch.num_atoms
         num_graphs = graph_batch.num_graphs
-        fermi = graph_batch.fermi 
-        charges = graph_batch.charges 
+        fermi = graph_batch.fermi
+        charges = graph_batch.charges if hasattr(graph_batch, 'charges') else torch.zeros(num_graphs)
         num_graphs = torch.tensor(num_graphs)
         batch = graph_batch.batch
 
@@ -1184,12 +1183,16 @@ def batch_to_dict(graph_batch, model_type="m3gnet", device="cuda"):
         input["batch"] = batch
 
         # Precomputed Ewald data (present when built via build_dataloader)
-        if hasattr(graph_batch, 'ewald_base_flat'):
-            input["ewald_base_flat"] = graph_batch.ewald_base_flat
-            input["ewald_distances"] = graph_batch.ewald_distances
+        if hasattr(graph_batch, 'ewald_pair_shifts'):
             input["ewald_pair_i"] = graph_batch.ewald_pair_i
             input["ewald_pair_j"] = graph_batch.ewald_pair_j
+            input["ewald_pair_shifts"] = graph_batch.ewald_pair_shifts
             input["num_ewald_pairs"] = graph_batch.num_ewald_pairs
+            input["ewald_k_vectors"] = graph_batch.ewald_k_vectors
+            input["ewald_k_lengths"] = graph_batch.ewald_k_lengths
+            input["num_ewald_kvecs"] = graph_batch.num_ewald_kvecs
+            input["ewald_eta"] = graph_batch.ewald_eta
+            input["ewald_volume"] = graph_batch.ewald_volume
     elif model_type == "graphormer" or model_type == "geomformer":
         raise NotImplementedError
     else:

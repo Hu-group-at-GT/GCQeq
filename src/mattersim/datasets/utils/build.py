@@ -6,21 +6,8 @@ import numpy as np
 import torch
 from ase import Atoms
 from torch_geometric.loader import DataLoader as DataLoader_pyg
-from tqdm import tqdm
 
 from mattersim.datasets.utils.convertor import GraphConvertor
-
-def save_preprocessed(data_list, path):
-    """Save preprocessed Data list to disk."""
-    torch.save(data_list, path)
-    print(f"Saved {len(data_list)} preprocessed graphs to {path}")
-
-
-def load_preprocessed(path):
-    """Load preprocessed Data list from disk."""
-    data_list = torch.load(path, weights_only=False)
-    print(f"Loaded {len(data_list)} preprocessed graphs from {path}")
-    return data_list
 
 
 def build_dataloader(
@@ -43,28 +30,55 @@ def build_dataloader(
     dataset=None,
     finetune_task_label: list = None,
     preprocessed_path: str = None,
+    is_distributed: bool = False,
     **kwargs,
 ):
     """
-    Build a dataloader given a list of atoms
-        - atoms : a list of atoms in ase format
-        - energies, forces and stresses are necessary for training
-            - energies : a list of energy (float) with unit eV
-            - forces : a list of nx3 force matrix (np.ndarray) with unit eV/Å,
-                where n is the number of atom in each structure.
-            - stresses : a list of 3x3 stress matrix (np.ndarray) with unit GPa
-        - charges 
-        - fermi_values
-        - only_inference : if True, energies, forces and stresses will be ignored
-        - num_workers : number of workers for dataloader
-        - pin_memory : if True, the datasets will be stored in GPU or CPU memory
-        - pin_memory_device : the device for pin_memory
-        - dataset : the dataset object for the dataloader
-                    only used for graphormer and geomformer
+    Build a dataloader given a list of atoms or a path to preprocessed data.
+
+    If preprocessed_path is provided and exists, the cached data is loaded
+    directly (no conversion is performed). Otherwise atoms are converted
+    to graphs on-the-fly.
+
+    To create the preprocessed cache, use ``finetune/preprocess.py``.
+
+    Args:
+        atoms: list of ASE Atoms objects
+        energies: list of energies (eV)
+        charges: list of total charges
+        fermi_values: list of Fermi energies
+        forces: list of nx3 force arrays (eV/A)
+        stresses: list of 3x3 stress arrays (GPa)
+        preprocessed_path: path to a .pt file saved by preprocess.py
+        only_inference: if True, labels are not required
     """
 
-    convertor = GraphConvertor(model_type, cutoff, True, threebody_cutoff)
+    if model_type == "graphormer" or model_type == "geomformer":
+        raise NotImplementedError
 
+    import os
+
+    # load preprocessed cache produced by preprocess.py
+    if preprocessed_path and os.path.exists(preprocessed_path):
+        preprocessed_data = torch.load(preprocessed_path, weights_only=False, mmap=True)
+        print(f"Loaded {len(preprocessed_data)} preprocessed graphs from {preprocessed_path}")
+
+        sampler = None
+        if is_distributed:
+            sampler = torch.utils.data.distributed.DistributedSampler(
+                preprocessed_data, shuffle=shuffle
+            )
+        return DataLoader_pyg(
+            preprocessed_data,
+            batch_size=batch_size,
+            shuffle=(shuffle if sampler is None else False),
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            sampler=sampler,
+        )
+
+    # convert atoms to graphs on-the-fly
+    convertor = GraphConvertor(model_type, cutoff, True, threebody_cutoff)
     preprocessed_data = []
 
     if dataset is None:
@@ -87,92 +101,67 @@ def build_dataloader(
             stresses = [None] * length
         if fermi_values is None:
             fermi_values = [None] * length
-        if charges is None:  
+        if charges is None:
             charges = [None] * length
 
-    import os
-
-    if model_type == "m3gnet":
-        # Fast path: load from cache if available
-        if preprocessed_path and os.path.exists(preprocessed_path):
-            preprocessed_data = load_preprocessed(preprocessed_path)
-            print("Successfully loaded preprocessed data from {}".format(preprocessed_path))
-            return DataLoader_pyg(
-                preprocessed_data,
-                batch_size=batch_size,
-                shuffle=shuffle,
-                num_workers=num_workers,
-                pin_memory=pin_memory,
+    if multiprocessing == 0 and multithreading == 0:
+        for graph, energy, force, stress, charge, fermi in zip(atoms, energies, forces, stresses, charges, fermi_values):
+            graph = convertor.convert(
+                graph.copy(), energy, force, stress, charge, fermi, **kwargs
             )
+            if graph is not None:
+                preprocessed_data.append(graph)
+    elif multithreading > 0 and multiprocessing == 0:
+        from multiprocessing.pool import ThreadPool
 
-        from mattersim.forcefield.m3gnet.modules.GCQeqSolver import precompute_ewald_data
-
-        if multiprocessing == 0 and multithreading == 0:
-            for graph, energy, force, stress, charge, fermi in tqdm(
-                zip(atoms, energies, forces, stresses, charges, fermi_values),
-                total=len(atoms),
-                desc="Preprocessing graphs",
-            ):
-                graph = convertor.convert(graph.copy(), energy, force, stress, charge, fermi, **kwargs)
-                if graph is not None:
-                    ewald = precompute_ewald_data(graph.cell.squeeze(0), graph.atom_pos)
-                    graph.ewald_base_flat = ewald['base_matrix'].flatten()
-                    graph.ewald_distances = ewald['filtered_distances']
-                    graph.ewald_pair_i = ewald['pair_i']
-                    graph.ewald_pair_j = ewald['pair_j']
-                    graph.num_ewald_pairs = len(ewald['filtered_distances'])
-                    preprocessed_data.append(graph)
-        elif multithreading > 0 and multiprocessing == 0:
-            from multiprocessing.pool import ThreadPool
-
-            warnings.warn("multithreading is experimental")
-            warnings.warn("it may not be faster than single thread due to GIL.")
-            print("Using multithreading with {} threads".format(multithreading))
-            start = time.time()
-            pool = ThreadPool(processes=multithreading)
-            preprocessed_data = pool.starmap(
-               convertor.convert, zip(atoms, energies, forces, stresses, charges, fermi_values) 
-            )
-            pool.close()
-            print("Time elapsed: {:.2f} s".format(time.time() - start))
-        elif multiprocessing > 0 and multithreading == 0:
-            import multiprocessing as mp
-
-            warnings.warn("multiprocessing is experimental.")
-            print("Using multiprocessing with {} workers".format(multiprocessing))
-            # torch.multiprocessing.set_sharing_strategy('file_system')
-            start = time.time()
-            pool = mp.Pool(multiprocessing)
-            results = []
-            for i in range(multiprocessing):
-                left = int(i * length / multiprocessing)
-                right = int((i + 1) * length / multiprocessing)
-                results.append(
-                    pool.apply_async(multiprocess_data, args=(atoms[left:right], 1))
-                )
-            pool.close()
-            pool.join()
-            for result in results:
-                graph = result.get()
-                if graph is not None:
-                    preprocessed_data.extend(graph)
-            print("Time for multiprocessing: {:.2f} s".format(time.time() - start))
-        else:
-            raise NotImplementedError
-
-        if preprocessed_path:
-            save_preprocessed(preprocessed_data, preprocessed_path)
-
-        return DataLoader_pyg(
-            preprocessed_data,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
+        warnings.warn("multithreading is experimental")
+        warnings.warn("it may not be faster than single thread due to GIL.")
+        print("Using multithreading with {} threads".format(multithreading))
+        start = time.time()
+        pool = ThreadPool(processes=multithreading)
+        preprocessed_data = pool.starmap(
+            convertor.convert,
+            zip(atoms, energies, forces, stresses, charges, fermi_values),
         )
+        pool.close()
+        print("Time elapsed: {:.2f} s".format(time.time() - start))
+    elif multiprocessing > 0 and multithreading == 0:
+        import multiprocessing as mp
 
-    elif model_type == "graphormer" or model_type == "geomformer":
+        warnings.warn("multiprocessing is experimental.")
+        print("Using multiprocessing with {} workers".format(multiprocessing))
+        start = time.time()
+        pool = mp.Pool(multiprocessing)
+        results = []
+        for i in range(multiprocessing):
+            left = int(i * length / multiprocessing)
+            right = int((i + 1) * length / multiprocessing)
+            results.append(
+                pool.apply_async(multiprocess_data, args=(atoms[left:right], 1))
+            )
+        pool.close()
+        pool.join()
+        for result in results:
+            graph = result.get()
+            if graph is not None:
+                preprocessed_data.extend(graph)
+        print("Time for multiprocessing: {:.2f} s".format(time.time() - start))
+    else:
         raise NotImplementedError
+
+    sampler = None
+    if is_distributed:
+        sampler = torch.utils.data.distributed.DistributedSampler(
+            preprocessed_data, shuffle=shuffle
+        )
+    return DataLoader_pyg(
+        preprocessed_data,
+        batch_size=batch_size,
+        shuffle=(shuffle if sampler is None else False),
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        sampler=sampler,
+    )
 
 def multiprocess_data(atoms: list[Atoms], number):
     convertor = GraphConvertor()
