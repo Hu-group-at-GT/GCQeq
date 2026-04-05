@@ -17,7 +17,7 @@ from .modules import (  # noqa: F501
 )
 from .scaling import AtomScaling
 
-from .modules.GCQeqSolver import GCQeqSolver, apply_sigma_correction
+from .modules.GCQeqSolver import GCQeqSolver, recompute_energy_matrix
 from .modules.init_elemental_properties import get_sigma
 
 
@@ -172,15 +172,19 @@ class M3Gnet(nn.Module):
         sigma_factor = self.MLP4(aev_with_fermi).view(-1)  # [batch_size*num_atoms]
 
         # Build and solve Ewald system per graph (serial)
-        has_precomputed = "ewald_base_flat" in input
+        has_precomputed = "ewald_pair_shifts" in input
         if has_precomputed:
-            base_flat = input["ewald_base_flat"]
-            ewald_dists = input["ewald_distances"]
             ewald_pi = input["ewald_pair_i"]
             ewald_pj = input["ewald_pair_j"]
+            ewald_shifts = input["ewald_pair_shifts"]
             num_ewald_pairs = input["num_ewald_pairs"]
-            base_offset = 0
+            ewald_kvecs = input["ewald_k_vectors"]
+            ewald_klens = input["ewald_k_lengths"]
+            num_ewald_kvecs = input["num_ewald_kvecs"]
+            ewald_eta = input["ewald_eta"]
+            ewald_volume = input["ewald_volume"]
             pair_offset = 0
+            kvec_offset = 0
 
         Q_list = []
         Q_tot_list = []
@@ -197,18 +201,25 @@ class M3Gnet(nn.Module):
             fermi_i = fermi[i]
 
             if has_precomputed:
-                # Training path: precomputed base matrix + cheap sigma correction
-                n_sq = n * n
-                base_matrix_i = base_flat[base_offset:base_offset + n_sq].view(n, n)
+                # Training path: recompute energy matrix from cached structural
+                # data with live pos in the autograd graph for correct forces
+                pos_i = pos[atom_offset:atom_offset + n]
+                cell_i = cell[i]
                 k_i = num_ewald_pairs[i].item()
-                dists_i = ewald_dists[pair_offset:pair_offset + k_i]
                 pi_i = ewald_pi[pair_offset:pair_offset + k_i]
                 pj_i = ewald_pj[pair_offset:pair_offset + k_i]
-                energy_matrix_i = apply_sigma_correction(
-                    base_matrix_i, dists_i, pi_i, pj_i, sigma_i
+                shifts_i = ewald_shifts[pair_offset:pair_offset + k_i]
+                m_i = num_ewald_kvecs[i].item()
+                kvecs_i = ewald_kvecs[kvec_offset:kvec_offset + m_i]
+                klens_i = ewald_klens[kvec_offset:kvec_offset + m_i]
+                energy_matrix_i = recompute_energy_matrix(
+                    pos_i, cell_i, sigma_i,
+                    pi_i, pj_i, shifts_i,
+                    kvecs_i, klens_i,
+                    ewald_eta[i], ewald_volume[i],
                 )
-                base_offset += n_sq
                 pair_offset += k_i
+                kvec_offset += m_i
             else:
                 # Inference path: full Ewald computation
                 pos_i = pos[atom_offset:atom_offset + n]
