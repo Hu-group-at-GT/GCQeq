@@ -1162,7 +1162,7 @@ def batch_to_dict(graph_batch, model_type="m3gnet", device="cuda"):
         num_atoms = graph_batch.num_atoms
         num_graphs = graph_batch.num_graphs
         fermi = graph_batch.fermi 
-        charges = graph_batch.charges 
+        charges = graph_batch.charges if hasattr(graph_batch, 'charges') else torch.zeros(num_graphs)
         num_graphs = torch.tensor(num_graphs)
         batch = graph_batch.batch
 
