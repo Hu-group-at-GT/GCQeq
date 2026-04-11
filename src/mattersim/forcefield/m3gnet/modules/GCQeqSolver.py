@@ -43,35 +43,11 @@ class GCQeqSolver:
         e_real_matrix = self._calc_real_energy_matrix()
         e_recip_matrix = self._calc_reciprocal_energy_matrix()
         e_self_matrix = self._calc_self_energy_matrix()
-        e_dipole_correction_matrix = self._calc_dipole_correction_matrix()
-
-        self.energy_matrix = e_real_matrix + e_recip_matrix + e_self_matrix + e_dipole_correction_matrix
+        self.energy_matrix = e_real_matrix + e_recip_matrix + e_self_matrix
 
     @property
     def num_atoms(self):
         return self.pos.shape[0]
-
-    def _calc_dipole_correction_matrix(self):
-        """
-        Compute dipole and constant-background charge correction matrix
-        DOI: 10.1063/1.3216473 "Simulations of non-neutral slab systems with
-        long-range electrostatic interactions in two-dimensional periodic boundary conditions"
-        """
-        prefac = (4.0 * math.pi / self.volume)
-
-        z = self.pos[:, 2] # (N,)
-        term1 = z.unsqueeze(1) * z.unsqueeze(0) # (N, 1) x (1, N)
-
-        z_squared = z**2
-        term2 = 0.5 * (z_squared.unsqueeze(1) + z_squared.unsqueeze(0))
-
-        Lz = torch.norm(self.cell[2], dim=-1)
-        ones = torch.ones(self.num_atoms, device=self.pos.device)
-        term3 = (Lz**2 / 12.0) * ones.unsqueeze(1) * ones.unsqueeze(0)
-
-        dipole_correction = prefac * (term1 - term2 - term3)
-
-        return COULOMB_FACTOR * dipole_correction
 
     def _calc_real_energy_matrix(self):
         """
@@ -264,18 +240,7 @@ def recompute_energy_matrix(pos, cell, sigmas, pair_i, pair_j, pair_shifts,
     diag = diag + 1.0 / (math.sqrt(math.pi) * sigmas.flatten())
     self_matrix = COULOMB_FACTOR * torch.diag(diag)
 
-    # --- Dipole correction (autograd through pos z-coordinates) ---
-    z = pos[:, 2]
-    prefac = 4.0 * math.pi / vol_val
-    term1 = z.unsqueeze(1) * z.unsqueeze(0)
-    z_sq = z ** 2
-    term2 = 0.5 * (z_sq.unsqueeze(1) + z_sq.unsqueeze(0))
-    Lz = torch.norm(cell[2], dim=-1)
-    ones = torch.ones(num_atoms, device=pos.device, dtype=pos.dtype)
-    term3 = (Lz ** 2 / 12.0) * ones.unsqueeze(1) * ones.unsqueeze(0)
-    dipole_matrix = COULOMB_FACTOR * prefac * (term1 - term2 - term3)
-
-    return real_matrix + recip_matrix + self_matrix + dipole_matrix
+    return real_matrix + recip_matrix + self_matrix
 
 
 # ---------------------------------------------------------------------------
